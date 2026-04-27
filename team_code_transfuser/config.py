@@ -119,6 +119,7 @@ class GlobalConfig:
     # Optimization
     lr = 1e-4 # learning rate
     multitask = True # whether to use segmentation + depth losses
+    uncertainty_weights = False # whether to use uncertainty-weighted multi-task loss
     ls_seg   = 1.0
     ls_depth = 10.0
 

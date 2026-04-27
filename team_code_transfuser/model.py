@@ -550,6 +550,15 @@ class LidarCenterNet(nn.Module):
         self.use_target_point_image = config.use_target_point_image
         self.gru_concat_target_point = config.gru_concat_target_point
         self.use_point_pillars = config.use_point_pillars
+        self.uncertainty_weights = getattr(config, 'uncertainty_weights', False)
+        if self.uncertainty_weights:
+            self.log_vars = nn.ParameterDict({
+                'wp': nn.Parameter(torch.zeros(1)),
+                'bev': nn.Parameter(torch.zeros(1)),
+                'depth': nn.Parameter(torch.zeros(1)),
+                'semantic': nn.Parameter(torch.zeros(1)),
+                'detection': nn.Parameter(torch.zeros(1)),
+            })
 
         if(self.use_point_pillars == True):
             self.point_pillar_net = PointPillarNet(config.num_input, config.num_features,
@@ -607,6 +616,10 @@ class LidarCenterNet(nn.Module):
         # pid controller
         self.turn_controller = PIDController(K_P=config.turn_KP, K_I=config.turn_KI, K_D=config.turn_KD, n=config.turn_n)
         self.speed_controller = PIDController(K_P=config.speed_KP, K_I=config.speed_KI, K_D=config.speed_KD, n=config.speed_n)
+
+    def uncertainty_loss(self, loss_val, log_var):
+        precision = torch.exp(-log_var)
+        return precision * loss_val + 0.5 * log_var
 
     def forward_gru(self, z, target_point):
         z = self.join(z)
@@ -787,10 +800,23 @@ class LidarCenterNet(nn.Module):
                 "loss_semantic": loss_semantic
             })
         else:
+            loss_depth = torch.zeros_like(loss_wp)
+            loss_semantic = torch.zeros_like(loss_wp)
             loss.update({
-                "loss_depth": torch.zeros_like(loss_wp),
-                "loss_semantic": torch.zeros_like(loss_wp)
+                "loss_depth": loss_depth,
+                "loss_semantic": loss_semantic
             })
+
+        if self.uncertainty_weights:
+            loss_detection = (loss["loss_center_heatmap"] + loss["loss_wh"] + loss["loss_offset"]
+                              + loss["loss_yaw_class"] + loss["loss_yaw_res"]
+                              + loss["loss_velocity"] + loss["loss_brake"])
+            loss_total = (self.uncertainty_loss(loss_wp, self.log_vars['wp'])
+                          + self.uncertainty_loss(loss_bev, self.log_vars['bev'])
+                          + self.uncertainty_loss(loss_depth, self.log_vars['depth'])
+                          + self.uncertainty_loss(loss_semantic, self.log_vars['semantic'])
+                          + self.uncertainty_loss(loss_detection, self.log_vars['detection']))
+            loss["loss_total"] = loss_total
 
         self.i += 1
         if ((self.config.debug == True) and (self.i % self.config.train_debug_save_freq == 0) and (save_path != None)):

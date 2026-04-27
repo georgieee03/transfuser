@@ -65,6 +65,7 @@ def main():
                              ' the code will be parallelized across GPUs. If set to false/0, you launch the script with python train.py and only 1 GPU will be used.')
     parser.add_argument('--val_every', type=int, default=5, help='At which epoch frequency to validate.')
     parser.add_argument('--no_bev_loss', type=int, default=0, help='If set to true the BEV loss will not be trained. 0: Train normally, 1: set training weight for BEV to 0')
+    parser.add_argument('--uncertainty_weights', type=int, default=0, help='Whether to use uncertainty-weighted multi-task loss. 0:False, 1:True')
     parser.add_argument('--sync_batch_norm', type=int, default=0, help='0: Compute batch norm for each GPU independently, 1: Synchronize Batch norms accross GPUs. Only use with --parallel_training 1')
     parser.add_argument('--zero_redundancy_optimizer', type=int, default=0, help='0: Normal AdamW Optimizer, 1: Use Zero Reduncdancy Optimizer to reduce memory footprint. Only use with --parallel_training 1')
     parser.add_argument('--use_disk_cache', type=int, default=0, help='0: Do not cache the dataset 1: Cache the dataset on the disk pointed to by the SCRATCH enironment variable. Useful if the dataset is stored on slow HDDs and can be temporarily stored on faster SSD storage.')
@@ -120,6 +121,7 @@ def main():
     config.n_layer = args.n_layer
     config.use_point_pillars = bool(args.use_point_pillars)
     config.backbone = args.backbone
+    config.uncertainty_weights = bool(args.uncertainty_weights)
     if(bool(args.no_bev_loss)):
         index_bev = config.detailed_losses.index("loss_bev")
         config.detailed_losses_weights[index_bev] = 0.0
@@ -304,11 +306,16 @@ class Engine(object):
         for data in tqdm(self.dataloader_train):
             self.optimizer.zero_grad(set_to_none=True)
             losses = self.load_data_compute_loss(data)
-            loss = torch.tensor(0.0).to(self.device, dtype=torch.float32)
 
-            for key, value in losses.items():
-                loss += self.detailed_weights[key] * value
-                detailed_losses_epoch[key] += float(self.detailed_weights[key] * value.item())
+            if self.config.uncertainty_weights:
+                loss = losses["loss_total"]
+                for key in self.detailed_losses:
+                    detailed_losses_epoch[key] += float(losses[key].item())
+            else:
+                loss = torch.tensor(0.0).to(self.device, dtype=torch.float32)
+                for key, value in losses.items():
+                    loss += self.detailed_weights[key] * value
+                    detailed_losses_epoch[key] += float(self.detailed_weights[key] * value.item())
             loss.backward()
 
             self.optimizer.step()
@@ -330,11 +337,15 @@ class Engine(object):
         for data in tqdm(self.dataloader_val):
             losses = self.load_data_compute_loss(data)
 
-            loss = torch.tensor(0.0).to(self.device, dtype=torch.float32)
-
-            for key, value in losses.items():
-                loss += self.detailed_weights[key] * value
-                detailed_val_losses_epoch[key] += float(self.detailed_weights[key] * value.item())
+            if self.config.uncertainty_weights:
+                loss = losses["loss_total"]
+                for key in self.detailed_losses:
+                    detailed_val_losses_epoch[key] += float(losses[key].item())
+            else:
+                loss = torch.tensor(0.0).to(self.device, dtype=torch.float32)
+                for key, value in losses.items():
+                    loss += self.detailed_weights[key] * value
+                    detailed_val_losses_epoch[key] += float(self.detailed_weights[key] * value.item())
 
             num_batches += 1
             loss_epoch += float(loss.item())
