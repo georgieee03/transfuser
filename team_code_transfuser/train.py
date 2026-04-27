@@ -359,8 +359,19 @@ class Engine(object):
 
             if ((batch_idx % self.grad_accum_steps) == 0) or (batch_idx == num_train_batches):
                 if self.use_amp:
+                    self.scaler.unscale_(self.optimizer)
+                    valid_gradients = True
+                    for param in self.model.parameters():
+                        if param.grad is not None:
+                            if not torch.isfinite(param.grad).all():
+                                valid_gradients = False
+                                break
+                    if not valid_gradients:
+                        print("WARNING: Non-finite gradients detected, skipping step")
+                        self.optimizer.zero_grad(set_to_none=True)
+                        self.scaler.update()
+                        continue
                     if self.args.grad_clip > 0.0:
-                        self.scaler.unscale_(self.optimizer)
                         torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.args.grad_clip)
                     self.scaler.step(self.optimizer)
                     self.scaler.update()

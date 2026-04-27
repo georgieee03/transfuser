@@ -618,6 +618,7 @@ class LidarCenterNet(nn.Module):
         self.speed_controller = PIDController(K_P=config.speed_KP, K_I=config.speed_KI, K_D=config.speed_KD, n=config.speed_n)
 
     def uncertainty_loss(self, loss_val, log_var):
+        log_var = torch.clamp(log_var, min=-10.0, max=10.0)
         precision = torch.exp(-log_var)
         return precision * loss_val + 0.5 * log_var
 
@@ -785,8 +786,11 @@ class LidarCenterNet(nn.Module):
 
         gt_labels = torch.zeros_like(label[:, :, 0])
         gt_bboxes_ignore = label.sum(dim=-1) == 0.
-        loss_bbox = self.head.loss(preds[0], preds[1], preds[2], preds[3], preds[4], preds[5], preds[6],
-                                [label], gt_labels=[gt_labels], gt_bboxes_ignore=[gt_bboxes_ignore], img_metas=None)
+        with torch.cuda.amp.autocast(enabled=False):
+            preds_fp32 = tuple([[pred.float() for pred in pred_group] for pred_group in preds])
+            loss_bbox = self.head.loss(preds_fp32[0], preds_fp32[1], preds_fp32[2], preds_fp32[3],
+                                    preds_fp32[4], preds_fp32[5], preds_fp32[6],
+                                    [label.float()], gt_labels=[gt_labels], gt_bboxes_ignore=[gt_bboxes_ignore], img_metas=None)
         
         loss.update(loss_bbox)
 
