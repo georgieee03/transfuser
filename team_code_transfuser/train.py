@@ -7,6 +7,8 @@ import numpy as np
 import torch
 import torch.distributed as dist
 import torch.optim as optim
+from torch.cuda.amp import autocast, GradScaler
+from torch.optim.lr_scheduler import LambdaLR
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 
@@ -66,6 +68,11 @@ def main():
     parser.add_argument('--val_every', type=int, default=5, help='At which epoch frequency to validate.')
     parser.add_argument('--no_bev_loss', type=int, default=0, help='If set to true the BEV loss will not be trained. 0: Train normally, 1: set training weight for BEV to 0')
     parser.add_argument('--uncertainty_weights', type=int, default=0, help='Whether to use uncertainty-weighted multi-task loss. 0:False, 1:True')
+    parser.add_argument('--use_amp', type=int, default=0, help='Whether to use automatic mixed precision. 0:False, 1:True')
+    parser.add_argument('--grad_accum_steps', type=int, default=1, help='Number of gradient accumulation steps.')
+    parser.add_argument('--use_cosine_lr', type=int, default=0, help='Whether to use cosine LR with linear warmup. 0:False, 1:True')
+    parser.add_argument('--warmup_epochs', type=int, default=1, help='Number of linear warmup epochs for cosine LR.')
+    parser.add_argument('--grad_clip', type=float, default=0.0, help='Max gradient norm for clipping. 0.0 disables clipping.')
     parser.add_argument('--sync_batch_norm', type=int, default=0, help='0: Compute batch norm for each GPU independently, 1: Synchronize Batch norms accross GPUs. Only use with --parallel_training 1')
     parser.add_argument('--zero_redundancy_optimizer', type=int, default=0, help='0: Normal AdamW Optimizer, 1: Use Zero Reduncdancy Optimizer to reduce memory footprint. Only use with --parallel_training 1')
     parser.add_argument('--use_disk_cache', type=int, default=0, help='0: Do not cache the dataset 1: Cache the dataset on the disk pointed to by the SCRATCH enironment variable. Useful if the dataset is stored on slow HDDs and can be temporarily stored on faster SSD storage.')
@@ -184,8 +191,24 @@ def main():
         model.load_state_dict(torch.load(args.load_file, map_location=model.device))
         optimizer.load_state_dict(torch.load(args.load_file.replace("model_", "optimizer_"), map_location=model.device))
 
+    scheduler = None
+    if bool(args.use_cosine_lr):
+        grad_accum_steps = max(1, int(args.grad_accum_steps))
+        steps_per_epoch = max(1, int(np.ceil(len(dataloader_train) / float(grad_accum_steps))))
+        total_steps = max(1, int(args.epochs) * steps_per_epoch)
+        warmup_steps = max(0, int(args.warmup_epochs) * steps_per_epoch)
 
-    trainer = Engine(model=model, optimizer=optimizer, dataloader_train=dataloader_train, dataloader_val=dataloader_val,
+        def lr_lambda(current_step):
+            if warmup_steps > 0 and current_step < warmup_steps:
+                return float(current_step + 1) / float(warmup_steps)
+            progress = float(current_step - warmup_steps) / float(max(1, total_steps - warmup_steps))
+            progress = min(1.0, max(0.0, progress))
+            return 0.5 * (1.0 + np.cos(np.pi * progress))
+
+        scheduler = LambdaLR(optimizer, lr_lambda)
+
+
+    trainer = Engine(model=model, optimizer=optimizer, scheduler=scheduler, dataloader_train=dataloader_train, dataloader_val=dataloader_val,
                      args=args, config=config, writer=writer, device=device, rank=rank, world_size=world_size,
                      parallel=parallel, cur_epoch=args.start_epoch)
 
@@ -193,7 +216,7 @@ def main():
         if(parallel == True):
             # Update the seed depending on the epoch so that the distributed sampler will use different shuffles across different epochs
             sampler_train.set_epoch(epoch)
-        if ((epoch == args.schedule_reduce_epoch_01) or (epoch==args.schedule_reduce_epoch_02)) and (args.schedule == 1):
+        if ((epoch == args.schedule_reduce_epoch_01) or (epoch==args.schedule_reduce_epoch_02)) and (args.schedule == 1) and (not bool(args.use_cosine_lr)):
             current_lr = optimizer.param_groups[0]['lr']
             new_lr = current_lr * 0.1
             print("Reduce learning rate by factor 10 to:", new_lr)
@@ -217,7 +240,7 @@ class Engine(object):
     Engine that runs training.
     """
 
-    def __init__(self, model, optimizer, dataloader_train, dataloader_val, args, config, writer, device, rank=0, world_size=1, parallel=False, cur_epoch=0):
+    def __init__(self, model, optimizer, scheduler, dataloader_train, dataloader_val, args, config, writer, device, rank=0, world_size=1, parallel=False, cur_epoch=0):
         self.cur_epoch = cur_epoch
         self.bestval_epoch = cur_epoch
         self.train_loss = []
@@ -225,6 +248,7 @@ class Engine(object):
         self.bestval = 1e10
         self.model = model
         self.optimizer = optimizer
+        self.scheduler = scheduler
         self.dataloader_train = dataloader_train
         self.dataloader_val   = dataloader_val
         self.args = args
@@ -234,6 +258,9 @@ class Engine(object):
         self.rank = rank
         self.world_size = world_size
         self.parallel = parallel
+        self.use_amp = bool(self.args.use_amp)
+        self.grad_accum_steps = max(1, int(self.args.grad_accum_steps))
+        self.scaler = GradScaler(enabled=self.use_amp)
         self.vis_save_path = self.args.logdir + r'/visualizations'
         if(self.config.debug == True):
             pathlib.Path(self.vis_save_path).mkdir(parents=True, exist_ok=True)
@@ -302,23 +329,48 @@ class Engine(object):
         detailed_losses_epoch  = {key: 0.0 for key in self.detailed_losses}
         self.cur_epoch += 1
 
+        self.optimizer.zero_grad(set_to_none=True)
+        num_train_batches = len(self.dataloader_train)
+
         # Train loop
-        for data in tqdm(self.dataloader_train):
-            self.optimizer.zero_grad(set_to_none=True)
-            losses = self.load_data_compute_loss(data)
+        for batch_idx, data in enumerate(tqdm(self.dataloader_train), start=1):
+            with autocast(enabled=self.use_amp):
+                losses = self.load_data_compute_loss(data)
 
-            if self.config.uncertainty_weights:
-                loss = losses["loss_total"]
-                for key in self.detailed_losses:
-                    detailed_losses_epoch[key] += float(losses[key].item())
+                if self.config.uncertainty_weights:
+                    loss = losses["loss_total"]
+                    for key in self.detailed_losses:
+                        detailed_losses_epoch[key] += float(losses[key].item())
+                else:
+                    loss = torch.tensor(0.0).to(self.device, dtype=torch.float32)
+                    for key, value in losses.items():
+                        loss += self.detailed_weights[key] * value
+                        detailed_losses_epoch[key] += float(self.detailed_weights[key] * value.item())
+
+            if self.grad_accum_steps == 1:
+                backward_loss = loss
             else:
-                loss = torch.tensor(0.0).to(self.device, dtype=torch.float32)
-                for key, value in losses.items():
-                    loss += self.detailed_weights[key] * value
-                    detailed_losses_epoch[key] += float(self.detailed_weights[key] * value.item())
-            loss.backward()
+                backward_loss = loss / self.grad_accum_steps
 
-            self.optimizer.step()
+            if self.use_amp:
+                self.scaler.scale(backward_loss).backward()
+            else:
+                backward_loss.backward()
+
+            if ((batch_idx % self.grad_accum_steps) == 0) or (batch_idx == num_train_batches):
+                if self.use_amp:
+                    if self.args.grad_clip > 0.0:
+                        self.scaler.unscale_(self.optimizer)
+                        torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.args.grad_clip)
+                    self.scaler.step(self.optimizer)
+                    self.scaler.update()
+                else:
+                    if self.args.grad_clip > 0.0:
+                        torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.args.grad_clip)
+                    self.optimizer.step()
+                if self.scheduler is not None:
+                    self.scheduler.step()
+                self.optimizer.zero_grad(set_to_none=True)
             num_batches += 1
             loss_epoch += float(loss.item())
 
@@ -335,17 +387,18 @@ class Engine(object):
 
         # Evaluation loop loop
         for data in tqdm(self.dataloader_val):
-            losses = self.load_data_compute_loss(data)
+            with autocast(enabled=self.use_amp):
+                losses = self.load_data_compute_loss(data)
 
-            if self.config.uncertainty_weights:
-                loss = losses["loss_total"]
-                for key in self.detailed_losses:
-                    detailed_val_losses_epoch[key] += float(losses[key].item())
-            else:
-                loss = torch.tensor(0.0).to(self.device, dtype=torch.float32)
-                for key, value in losses.items():
-                    loss += self.detailed_weights[key] * value
-                    detailed_val_losses_epoch[key] += float(self.detailed_weights[key] * value.item())
+                if self.config.uncertainty_weights:
+                    loss = losses["loss_total"]
+                    for key in self.detailed_losses:
+                        detailed_val_losses_epoch[key] += float(losses[key].item())
+                else:
+                    loss = torch.tensor(0.0).to(self.device, dtype=torch.float32)
+                    for key, value in losses.items():
+                        loss += self.detailed_weights[key] * value
+                        detailed_val_losses_epoch[key] += float(self.detailed_weights[key] * value.item())
 
             num_batches += 1
             loss_epoch += float(loss.item())

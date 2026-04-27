@@ -119,7 +119,6 @@ class GlobalConfig:
     # Optimization
     lr = 1e-4 # learning rate
     multitask = True # whether to use segmentation + depth losses
-    uncertainty_weights = False # whether to use uncertainty-weighted multi-task loss
     ls_seg   = 1.0
     ls_depth = 10.0
 
@@ -135,6 +134,8 @@ class GlobalConfig:
     detailed_losses = ['loss_wp', 'loss_bev', 'loss_depth', 'loss_semantic', 'loss_center_heatmap', 'loss_wh',
                        'loss_offset', 'loss_yaw_class', 'loss_yaw_res', 'loss_velocity', 'loss_brake']
     detailed_losses_weights = [1.0, 1.0, 1.0, 1.0, 0.2, 0.2, 0.2, 0.2, 0.2, 0.0, 0.0]
+
+    uncertainty_weights = False # whether to use uncertainty-weighted multi-task loss
 
     perception_output_features = 512 # Number of features outputted by the perception branch.
     bev_features_chanels = 64 # Number of channels for the BEV feature pyramid
