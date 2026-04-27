@@ -4,6 +4,72 @@ from torch import nn
 import torch.nn.functional as F
 import timm
 
+
+def _first_conv(model):
+    if hasattr(model, 'conv1'):
+        return model.conv1
+    if hasattr(model, 'conv_stem'):
+        return model.conv_stem
+    raise ValueError("Unknown first-conv attribute for {}".format(type(model)))
+
+
+def _set_first_conv(model, conv):
+    found = False
+    if hasattr(model, 'conv1'):
+        model.conv1 = conv
+        found = True
+    if hasattr(model, 'conv_stem'):
+        model.conv_stem = conv
+        found = True
+    if not found:
+        raise ValueError("Unknown first-conv attribute for {}".format(type(model)))
+
+
+def _required_module(model, name):
+    if hasattr(model, name):
+        return getattr(model, name)
+    raise ValueError("Backbone {} has no required module '{}'".format(type(model), name))
+
+
+def _feature_info_list(model):
+    try:
+        return list(model.feature_info)
+    except TypeError:
+        return model.feature_info
+
+
+def _efficientnet_stage_ends(model):
+    feature_info = _feature_info_list(model)
+    if len(feature_info) < 5:
+        raise ValueError("EfficientNet backbone needs at least 5 feature_info entries for TransFuser fusion")
+
+    stage_ends = []
+    for info in feature_info[1:5]:
+        module = info.get('module', '')
+        parts = module.split('.')
+        if len(parts) < 2 or parts[0] != 'blocks':
+            raise ValueError("Unexpected EfficientNet feature module '{}'".format(module))
+        stage_ends.append(int(parts[1]))
+    return stage_ends
+
+
+def _configure_efficientnet_backbone(model):
+    if not hasattr(model, 'conv_stem') or not hasattr(model, 'blocks'):
+        raise ValueError("EfficientNet compatibility expects conv_stem and blocks on {}".format(type(model)))
+
+    model.conv1 = model.conv_stem
+    model.act1 = nn.Sequential()
+    model.maxpool = nn.Sequential()
+
+    blocks = list(model.blocks.children())
+    start = 0
+    for idx, end in enumerate(_efficientnet_stage_ends(model), start=1):
+        if end >= len(blocks) or end < start - 1:
+            raise ValueError("Invalid EfficientNet stage boundary {} for {}".format(end, type(model)))
+        setattr(model, 'layer{}'.format(idx), nn.Sequential(*blocks[start:end + 1]))
+        start = end + 1
+
+
 class TransfuserBackbone(nn.Module):
     """
     Multi-scale Fusion Transformer for image + LiDAR feature fusion
@@ -133,17 +199,11 @@ class TransfuserBackbone(nn.Module):
 
         lidar_tensor = lidar
 
-        image_features = self.image_encoder.features.conv1(image_tensor)
-        image_features = self.image_encoder.features.bn1(image_features)
-        image_features = self.image_encoder.features.act1(image_features)
-        image_features = self.image_encoder.features.maxpool(image_features)
-        lidar_features = self.lidar_encoder._model.conv1(lidar_tensor)
-        lidar_features = self.lidar_encoder._model.bn1(lidar_features)
-        lidar_features = self.lidar_encoder._model.act1(lidar_features)
-        lidar_features = self.lidar_encoder._model.maxpool(lidar_features)
+        image_features = self.image_encoder.forward_stem(image_tensor)
+        lidar_features = self.lidar_encoder.forward_stem(lidar_tensor)
 
-        image_features = self.image_encoder.features.layer1(image_features)
-        lidar_features = self.lidar_encoder._model.layer1(lidar_features)
+        image_features = self.image_encoder.forward_layer(1, image_features)
+        lidar_features = self.lidar_encoder.forward_layer(1, lidar_features)
 
         # Image fusion at (B, 72, 40, 176)
         # Lidar fusion at (B, 72, 64, 64)
@@ -156,8 +216,8 @@ class TransfuserBackbone(nn.Module):
         image_features = image_features + image_features_layer1
         lidar_features = lidar_features + lidar_features_layer1
 
-        image_features = self.image_encoder.features.layer2(image_features)
-        lidar_features = self.lidar_encoder._model.layer2(lidar_features)
+        image_features = self.image_encoder.forward_layer(2, image_features)
+        lidar_features = self.lidar_encoder.forward_layer(2, lidar_features)
         # Image fusion at (B, 216, 20, 88)
         # Image fusion at (B, 216, 32, 32)
         image_embd_layer2 = self.avgpool_img(image_features)
@@ -168,8 +228,8 @@ class TransfuserBackbone(nn.Module):
         image_features = image_features + image_features_layer2
         lidar_features = lidar_features + lidar_features_layer2
 
-        image_features = self.image_encoder.features.layer3(image_features)
-        lidar_features = self.lidar_encoder._model.layer3(lidar_features)
+        image_features = self.image_encoder.forward_layer(3, image_features)
+        lidar_features = self.lidar_encoder.forward_layer(3, lidar_features)
         # Image fusion at (B, 576, 10, 44)
         # Image fusion at (B, 576, 16, 16)
         image_embd_layer3 = self.avgpool_img(image_features)
@@ -180,8 +240,8 @@ class TransfuserBackbone(nn.Module):
         image_features = image_features + image_features_layer3
         lidar_features = lidar_features + lidar_features_layer3
 
-        image_features = self.image_encoder.features.layer4(image_features)
-        lidar_features = self.lidar_encoder._model.layer4(lidar_features)
+        image_features = self.image_encoder.forward_layer(4, image_features)
+        lidar_features = self.lidar_encoder.forward_layer(4, lidar_features)
         # Image fusion at (B, 1512, 5, 22)
         # Image fusion at (B, 1512, 8, 8)
         image_embd_layer4 = self.avgpool_img(image_features)
@@ -200,9 +260,9 @@ class TransfuserBackbone(nn.Module):
         x4 = lidar_features
         image_features_grid = image_features  # For auxilliary information
 
-        image_features = self.image_encoder.features.global_pool(image_features)
+        image_features = self.image_encoder.global_pool(image_features)
         image_features = torch.flatten(image_features, 1)
-        lidar_features = self.lidar_encoder._model.global_pool(lidar_features)
+        lidar_features = self.lidar_encoder.global_pool(lidar_features)
         lidar_features = torch.flatten(lidar_features, 1)
 
         fused_features = image_features + lidar_features
@@ -415,6 +475,22 @@ class ImageCNN(nn.Module):
             _tmp = self.features.global_pool.norm
             self.features.global_pool.norm = nn.LayerNorm((out_features,1,1), _tmp.eps, _tmp.elementwise_affine)
 
+        elif ('efficientnet' in architecture):
+            _configure_efficientnet_backbone(self.features)
+
+    def forward_stem(self, x):
+        x = _first_conv(self.features)(x)
+        x = _required_module(self.features, 'bn1')(x)
+        x = _required_module(self.features, 'act1')(x)
+        x = _required_module(self.features, 'maxpool')(x)
+        return x
+
+    def forward_layer(self, layer_idx, x):
+        return _required_module(self.features, 'layer{}'.format(layer_idx))(x)
+
+    def global_pool(self, x):
+        return _required_module(self.features, 'global_pool')(x)
+
 
 def normalize_imagenet(x):
     """ Normalize input images according to ImageNet standards.
@@ -470,12 +546,16 @@ class LidarEncoder(nn.Module):
             _tmp = self._model.global_pool.norm
             self._model.global_pool.norm = nn.LayerNorm((out_features,1,1), _tmp.eps, _tmp.elementwise_affine)
 
+        elif ('efficientnet' in architecture):
+            _configure_efficientnet_backbone(self._model)
+
         # Change the first conv layer so that it matches the amount of channels in the LiDAR
         # Timm might be able to do this automatically
-        _tmp = self._model.conv1
+        _tmp = _first_conv(self._model)
         use_bias = (_tmp.bias != None)
-        self._model.conv1 = nn.Conv2d(in_channels, out_channels=_tmp.out_channels,
+        new_conv = nn.Conv2d(in_channels, out_channels=_tmp.out_channels,
             kernel_size=_tmp.kernel_size, stride=_tmp.stride, padding=_tmp.padding, bias=use_bias)
+        _set_first_conv(self._model, new_conv)
         # Need to delete the old conv_layer to avoid unused parameters
         if architecture.startswith('convnext'):
           del self._model.stem._modules['0']
@@ -483,9 +563,22 @@ class LidarEncoder(nn.Module):
           del self._model.stem.conv
         torch.cuda.empty_cache()
         if(use_bias):
-            self._model.conv1.bias = _tmp.bias
+            _first_conv(self._model).bias = _tmp.bias
 
         del _tmp
+
+    def forward_stem(self, x):
+        x = _first_conv(self._model)(x)
+        x = _required_module(self._model, 'bn1')(x)
+        x = _required_module(self._model, 'act1')(x)
+        x = _required_module(self._model, 'maxpool')(x)
+        return x
+
+    def forward_layer(self, layer_idx, x):
+        return _required_module(self._model, 'layer{}'.format(layer_idx))(x)
+
+    def global_pool(self, x):
+        return _required_module(self._model, 'global_pool')(x)
 
 
 class SelfAttention(nn.Module):
